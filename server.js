@@ -1,27 +1,15 @@
-const express = require('express');
-const mysql = require('mysql2');
-const cors = require('cors');
+import express from 'express';
+import dotenv from 'dotenv';
+// const mysql = require('mysql2');
 
+dotenv.config()
+
+import { pool } from './src/db/db.js';
+import cors from 'cors';
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 1. DATABASE CONNECTION
-const db = mysql.createConnection({
-    host: 'localhost',
-    user: 'root',
-    password: '', // Your MySQL password
-    database: 'college_ms',
-    port: 3307    // Change to 3307 if your XAMPP uses that port
-});
-
-db.connect((err) => {
-    if (err) {
-        console.error('❌ Database connection failed:', err.message);
-        return;
-    }
-    console.log('✅ Successfully connected to MySQL');
-});
 
 // ==========================================
 // 2. LOGIN ROUTE
@@ -38,7 +26,7 @@ app.post('/api/login', (req, res) => {
         LEFT JOIN students s ON u.id = s.user_id
         WHERE u.username = ? AND u.password = ?`;
 
-    db.query(sql, [username, password], (err, data) => {
+    pool.query(sql, [username, password], (err, data) => {
         if (err) return res.status(500).json({ error: "Database error" });
         if (data.length > 0) {
             // This sends { id, username, role, full_name } to React
@@ -55,60 +43,50 @@ app.post('/api/login', (req, res) => {
 
 // GET all students
 app.get('/api/students', (req, res) => {
+     console.log("GET /api/students hit");
     const sql = `
         SELECT students.*, courses.course_name 
         FROM students 
         LEFT JOIN courses ON students.course_id = courses.id
     `;
-    db.query(sql, (err, data) => {
+    pool.query(sql, (err, data) => {
         if (err) return res.status(500).json(err);
         return res.json(data);
     });
 });
 
 // POST (Add) student
-app.post('/api/students', (req, res) => {
+app.post('/api/students', async (req, res) => {
     const { name, email, roll, password, semester, course_id } = req.body;
 
-    // Start a Transaction
-    db.beginTransaction((err) => {
-        if (err) return res.status(500).json({ error: "Transaction failed to start" });
-
-        // 1. Create the User Account
-        const userSql = "INSERT INTO users (username, password, role) VALUES (?, ?, 'student')";
-        db.query(userSql, [roll, password], (err, userResult) => {
-            if (err) {
-                return db.rollback(() => {
-                    res.status(500).json({ error: "Username (Roll No) already exists in users table." });
-                });
-            }
-
+    try {
+        await pool.transaction(async (tx) => {
+            const userSql = "INSERT INTO users (username, password, role) VALUES (?, ?, 'student')";
+            const userResult = await tx.query(userSql, [roll, password]);
             const userId = userResult.insertId;
 
-            // 2. Try to Create the Student Profile
             const studentSql = `
-                INSERT INTO students (user_id, course_id, enrollment_number, full_name, email, semester, admission_date, status) 
-                VALUES (?, ?, ?, ?, ?, ?, CURDATE(), 'Active')
+                INSERT INTO students (
+                    user_id, course_id, enrollment_number, full_name, date_of_birth, gender, email,
+                    phone_number, address, city, state, pin_code, guardian_name, guardian_phone,
+                    semester, admission_date, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_DATE, 'Active')
             `;
-            
-            db.query(studentSql, [userId, course_id, roll, name, email, semester || 1], (err, result) => {
-                if (err) {
-                    // IF THIS FAILS (e.g. duplicate email), DELETE THE USER RECORD AUTOMATICALLY
-                    return db.rollback(() => {
-                        res.status(400).json({ error: "Email already exists in students table. Both entries rolled back." });
-                    });
-                }
 
-                // If everything is perfect, save the changes permanently
-                db.commit((err) => {
-                    if (err) {
-                        return db.rollback(() => res.status(500).json({ error: "Commit failed" }));
-                    }
-                    res.json({ success: true });
-                });
-            });
+            await tx.query(studentSql, [
+                userId, course_id, roll, name, '2000-01-01', 'Other', email,
+                '', '', '', '', '', 'N/A', '', semester || 1
+            ]);
         });
-    });
+
+        res.json({ success: true });
+    } catch (err) {
+        const message = err.code === '23505'
+            ? "Username, roll number, or email already exists. Transaction rolled back."
+            : err.message;
+        res.status(400).json({ error: message });
+    }
 });
 
 
@@ -116,7 +94,7 @@ app.post('/api/students', (req, res) => {
 app.put('/api/students/:id', (req, res) => {
     const { name, email, roll, semester } = req.body;
     const sql = "UPDATE students SET full_name=?, email=?, enrollment_number=?, semester=? WHERE student_id=?";
-    db.query(sql, [name, email, roll, semester, req.params.id], (err, result) => {
+    pool.query(sql, [name, email, roll, semester, req.params.id], (err, result) => {
         if (err) return res.status(500).json(err);
         res.json({ success: true });
     });
@@ -125,7 +103,7 @@ app.put('/api/students/:id', (req, res) => {
 // DELETE student
 app.delete('/api/students/:id', (req, res) => {
     const sql = "DELETE FROM students WHERE student_id = ?";
-    db.query(sql, [req.params.id], (err, result) => {
+    pool.query(sql, [req.params.id], (err, result) => {
         if (err) return res.status(500).json(err);
         res.json({ success: true });
     });
@@ -139,59 +117,46 @@ app.delete('/api/students/:id', (req, res) => {
 // GET all teachers
 app.get('/api/teachers', (req, res) => {
     const sql = "SELECT * FROM teachers";
-    db.query(sql, (err, data) => {
+    pool.query(sql, (err, data) => {
         if (err) return res.status(500).json({ error: err.message });
         return res.json(data);
     });
 });
 
 // POST (Add) teacher
-app.post('/api/teachers', (req, res) => {
+app.post('/api/teachers', async (req, res) => {
     const { full_name, email, employee_id, department, qualification, designation, password } = req.body;
 
-    // Start a Transaction
-    db.beginTransaction((err) => {
-        if (err) return res.status(500).json({ error: "Transaction failed" });
-
-        // 1. Create the User Account (Username = Employee ID)
-        const userSql = "INSERT INTO users (username, password, role) VALUES (?, ?, 'teacher')";
-        db.query(userSql, [employee_id, password], (err, userResult) => {
-            if (err) {
-                return db.rollback(() => {
-                    res.status(400).json({ error: "Employee ID (Username) already exists." });
-                });
-            }
-
+    try {
+        await pool.transaction(async (tx) => {
+            const userSql = "INSERT INTO users (username, password, role) VALUES (?, ?, 'teacher')";
+            const userResult = await tx.query(userSql, [employee_id, password]);
             const userId = userResult.insertId;
 
-            // 2. Create the Teacher Profile
             const teacherSql = `
-                INSERT INTO teachers (user_id, employee_id, full_name, email, department, qualification, designation, joining_date) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURDATE())
+                INSERT INTO teachers (
+                    user_id, employee_id, full_name, gender, email, phone_number,
+                    department, qualification, designation, joining_date
+                )
+                VALUES (?, ?, ?, 'Other', ?, '', ?, ?, ?, CURRENT_DATE)
             `;
-            
-            db.query(teacherSql, [userId, employee_id, full_name, email, department, qualification, designation], (err, result) => {
-                if (err) {
-                    // IF EMAIL IS DUPLICATE: Undo the User creation
-                    return db.rollback(() => {
-                        res.status(400).json({ error: "Email already exists in teacher records. Transaction rolled back." });
-                    });
-                }
 
-                // If both are successful, commit the changes permanently
-                db.commit((err) => {
-                    if (err) return db.rollback(() => res.status(500).json({ error: "Commit failed" }));
-                    res.json({ success: true, message: "Faculty registered successfully" });
-                });
-            });
+            await tx.query(teacherSql, [userId, employee_id, full_name, email, department, qualification, designation]);
         });
-    });
+
+        res.json({ success: true, message: "Faculty registered successfully" });
+    } catch (err) {
+        const message = err.code === '23505'
+            ? "Employee ID or email already exists. Transaction rolled back."
+            : err.message;
+        res.status(400).json({ error: message });
+    }
 });
 
 app.put('/api/teachers/:id', (req, res) => {
     const { full_name, email, employee_id, department, qualification, designation } = req.body;
     const sql = "UPDATE teachers SET full_name=?, email=?, employee_id=?, department=?, qualification=?, designation=? WHERE teacher_id=?";
-    db.query(sql, [full_name, email, employee_id, department, qualification, designation, req.params.id], (err, result) => {
+    pool.query(sql, [full_name, email, employee_id, department, qualification, designation, req.params.id], (err, result) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true });
     });
@@ -200,7 +165,7 @@ app.put('/api/teachers/:id', (req, res) => {
 // DELETE teacher
 app.delete('/api/teachers/:id', (req, res) => {
     const sql = "DELETE FROM teachers WHERE teacher_id = ?";
-    db.query(sql, [req.params.id], (err, result) => {
+    pool.query(sql, [req.params.id], (err, result) => {
         if (err) return res.status(500).json(err);
         res.json({ success: true });
     });
@@ -213,7 +178,7 @@ app.delete('/api/teachers/:id', (req, res) => {
 // GET all courses
 app.get('/api/courses', (req, res) => {
     const sql = "SELECT * FROM courses";
-    db.query(sql, (err, data) => {
+    pool.query(sql, (err, data) => {
         if (err) return res.status(500).json({ error: err.message });
         return res.json(data);
     });
@@ -224,7 +189,7 @@ app.post('/api/courses', (req, res) => {
     const { course_code, course_name, department, duration_years, total_semesters } = req.body;
     const sql = "INSERT INTO courses (course_code, course_name, department, duration_years, total_semesters) VALUES (?, ?, ?, ?, ?)";
     
-    db.query(sql, [course_code, course_name, department, duration_years, total_semesters], (err, result) => {
+    pool.query(sql, [course_code, course_name, department, duration_years, total_semesters], (err, result) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true, message: "Course added successfully" });
     });
@@ -235,7 +200,7 @@ app.put('/api/courses/:id', (req, res) => {
     const { course_code, course_name, department, duration_years, total_semesters } = req.body;
     const sql = "UPDATE courses SET course_code=?, course_name=?, department=?, duration_years=?, total_semesters=? WHERE id=?";
     
-    db.query(sql, [course_code, course_name, department, duration_years, total_semesters, req.params.id], (err, result) => {
+    pool.query(sql, [course_code, course_name, department, duration_years, total_semesters, req.params.id], (err, result) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true });
     });
@@ -244,7 +209,7 @@ app.put('/api/courses/:id', (req, res) => {
 // DELETE course
 app.delete('/api/courses/:id', (req, res) => {
     const sql = "DELETE FROM courses WHERE id = ?";
-    db.query(sql, [req.params.id], (err, result) => {
+    pool.query(sql, [req.params.id], (err, result) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true });
     });
@@ -263,7 +228,7 @@ app.get('/api/subjects', (req, res) => {
         LEFT JOIN teacher_assignments ON subjects.id = teacher_assignments.subject_id
         LEFT JOIN teachers ON teacher_assignments.teacher_id = teachers.teacher_id
     `;
-    db.query(sql, (err, data) => {
+    pool.query(sql, (err, data) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(data);
     });
@@ -274,43 +239,41 @@ app.post('/api/subjects', (req, res) => {
     const { course_id, semester, subject_code, subject_name, subject_type, credits } = req.body;
     const sql = "INSERT INTO subjects (course_id, semester, subject_code, subject_name, subject_type, credits) VALUES (?, ?, ?, ?, ?, ?)";
     
-    db.query(sql, [course_id, semester, subject_code, subject_name, subject_type, credits], (err, result) => {
+    pool.query(sql, [course_id, semester, subject_code, subject_name, subject_type, credits], (err, result) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true, id: result.insertId });
     });
 });
 
-app.put('/api/subjects/:id', (req, res) => {
+app.put('/api/subjects/:id', async (req, res) => {
     const subjectId = req.params.id;
     const { subject_code, subject_name, course_id, semester, subject_type, credits, teacher_id } = req.body;
 
-    db.beginTransaction((err) => {
-        if (err) return res.status(500).json({ error: "Transaction Error" });
+    try {
+        await pool.transaction(async (tx) => {
+            const subSql = "UPDATE subjects SET course_id=?, semester=?, subject_code=?, subject_name=?, subject_type=?, credits=? WHERE id=?";
+            await tx.query(subSql, [course_id, semester, subject_code, subject_name, subject_type, credits, subjectId]);
 
-        // 1. Update the subject details
-        const subSql = "UPDATE subjects SET course_id=?, semester=?, subject_code=?, subject_name=?, subject_type=?, credits=? WHERE id=?";
-        db.query(subSql, [course_id, semester, subject_code, subject_name, subject_type, credits, subjectId], (err) => {
-            if (err) return db.rollback(() => res.status(500).json(err));
+            await tx.query("DELETE FROM teacher_assignments WHERE subject_id=? AND academic_year='2026-2027'", [subjectId]);
 
-            // 2. Update the teacher assignment
-            // We use REPLACE INTO so it inserts if new, or updates if it exists
-            const assignSql = "REPLACE INTO teacher_assignments (teacher_id, subject_id, academic_year) VALUES (?, ?, '2026-2027')";
-            db.query(assignSql, [teacher_id, subjectId], (err) => {
-                if (err) return db.rollback(() => res.status(500).json(err));
-
-                db.commit((err) => {
-                    if (err) return db.rollback(() => res.status(500).json(err));
-                    res.json({ success: true });
-                });
-            });
+            if (teacher_id) {
+                await tx.query(
+                    "INSERT INTO teacher_assignments (teacher_id, subject_id, academic_year) VALUES (?, ?, '2026-2027')",
+                    [teacher_id, subjectId]
+                );
+            }
         });
-    });
+
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // DELETE subject
 app.delete('/api/subjects/:id', (req, res) => {
     const sql = "DELETE FROM subjects WHERE id = ?";
-    db.query(sql, [req.params.id], (err, result) => {
+    pool.query(sql, [req.params.id], (err, result) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true });
     });
@@ -324,7 +287,7 @@ app.delete('/api/subjects/:id', (req, res) => {
 app.get('/api/notices', (req, res) => {
     // Select date as 'date' to match your frontend accessor
     const sql = "SELECT id, title, content, target_role, priority, attachment_url, DATE_FORMAT(created_at, '%Y-%m-%d') as date FROM notices ORDER BY created_at DESC";
-    db.query(sql, (err, data) => {
+    pool.query(sql, (err, data) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(data);
     });
@@ -341,7 +304,7 @@ app.post('/api/notices', (req, res) => {
 
     const sql = "INSERT INTO notices (title, content, target_role, priority, attachment_url, posted_by) VALUES (?, ?, ?, ?, ?, ?)";
     
-    db.query(sql, [title, content, target_role, priority, attachment_url, posted_by], (err, result) => {
+    pool.query(sql, [title, content, target_role, priority, attachment_url, posted_by], (err, result) => {
         if (err) {
             console.error(err);
             return res.status(500).json({ error: err.message });
@@ -355,7 +318,7 @@ app.put('/api/notices/:id', (req, res) => {
     const { title, content, target_role, priority, attachment_url } = req.body;
     const sql = "UPDATE notices SET title=?, content=?, target_role=?, priority=?, attachment_url=? WHERE id=?";
     
-    db.query(sql, [title, content, target_role, priority, attachment_url, req.params.id], (err, result) => {
+    pool.query(sql, [title, content, target_role, priority, attachment_url, req.params.id], (err, result) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true });
     });
@@ -364,7 +327,7 @@ app.put('/api/notices/:id', (req, res) => {
 // DELETE notice
 app.delete('/api/notices/:id', (req, res) => {
     const sql = "DELETE FROM notices WHERE id = ?";
-    db.query(sql, [req.params.id], (err, result) => {
+    pool.query(sql, [req.params.id], (err, result) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ success: true });
     });
@@ -395,10 +358,10 @@ app.get('/api/admin/dashboard-stats', (req, res) => {
         LIMIT 5
     `;
 
-    db.query(statsSql, (err, statsData) => {
+    pool.query(statsSql, (err, statsData) => {
         if (err) return res.status(500).json({ error: err.message });
         
-        db.query(activitySql, (err, activityData) => {
+        pool.query(activitySql, (err, activityData) => {
             if (err) return res.status(500).json({ error: err.message });
             
             res.json({
@@ -432,7 +395,7 @@ app.get('/api/teacher/:id/assigned-subjects', (req, res) => {
         WHERE ta.teacher_id = (SELECT teacher_id FROM teachers WHERE user_id = ?)
     `;
 
-    db.query(sql, [req.params.id], (err, data) => {
+    pool.query(sql, [req.params.id], (err, data) => {
         if (err) {
             console.error("❌ SQL ERROR:", err.sqlMessage);
             return res.status(500).json(err);
@@ -453,7 +416,7 @@ app.get('/api/teacher/:id/notices', (req, res) => {
            OR n.posted_by = ?
         ORDER BY n.created_at DESC
     `;
-    db.query(sql, [req.params.id], (err, data) => {
+    pool.query(sql, [req.params.id], (err, data) => {
         if (err) return res.status(500).json(err);
         res.json(data);
     });
@@ -466,7 +429,7 @@ app.post('/api/attendance', (req, res) => {
     // STEP 1: Find the actual teacher_id using the logged-in user_id
     const getTeacherSql = `SELECT teacher_id FROM teachers WHERE user_id = ?`;
 
-    db.query(getTeacherSql, [marked_by], (err, teacherData) => {
+    pool.query(getTeacherSql, [marked_by], (err, teacherData) => {
         if (err || teacherData.length === 0) {
             console.error("❌ Error finding teacher:", err);
             return res.status(500).json({ error: "Teacher lookup failed" });
@@ -477,7 +440,7 @@ app.post('/api/attendance', (req, res) => {
         // STEP 2: Ensure a 'daily_class' exists for this date so we don't violate Foreign Keys
         const checkClassSql = `SELECT id FROM daily_classes WHERE subject_id = ? AND class_date = ?`;
 
-        db.query(checkClassSql, [subject_id, date], (err, classData) => {
+        pool.query(checkClassSql, [subject_id, date], (err, classData) => {
             if (err) return res.status(500).json({ error: "Class lookup failed" });
 
             // Helper function to insert the attendance once we have a valid class ID
@@ -490,14 +453,15 @@ app.post('/api/attendance', (req, res) => {
                     actualTeacherId
                 ]);
 
-                // ON DUPLICATE KEY ensures that if a teacher updates a mistake and hits save again, it safely updates!
+                // ON CONFLICT keeps repeated attendance saves idempotent.
                 const insertSql = `
                     INSERT INTO attendance (student_id, daily_class_id, status, remarks, marked_by) 
                     VALUES ?
-                    ON DUPLICATE KEY UPDATE status = VALUES(status), marked_by = VALUES(marked_by)
+                    ON CONFLICT (student_id, daily_class_id)
+                    DO UPDATE SET status = EXCLUDED.status, marked_by = EXCLUDED.marked_by, remarks = EXCLUDED.remarks
                 `;
 
-                db.query(insertSql, [values], (insertErr, result) => {
+                pool.query(insertSql, [values], (insertErr, result) => {
                     if (insertErr) {
                         console.error("❌ SQL ERROR saving attendance:", insertErr.sqlMessage);
                         return res.status(500).json({ error: "Failed to save attendance" });
@@ -514,7 +478,7 @@ app.post('/api/attendance', (req, res) => {
                     INSERT INTO daily_classes (subject_id, teacher_id, class_date, start_time, end_time, room_number, status) 
                     VALUES (?, ?, ?, '09:00', '10:00', 'TBA', 'Completed')
                 `;
-                db.query(createClassSql, [subject_id, actualTeacherId, date], (err, newClass) => {
+                pool.query(createClassSql, [subject_id, actualTeacherId, date], (err, newClass) => {
                     if (err) {
                         console.error("❌ SQL ERROR creating class:", err.sqlMessage);
                         return res.status(500).json({ error: "Failed to auto-create class session" });
@@ -543,7 +507,7 @@ app.get('/api/subjects/:id/students', (req, res) => {
         WHERE sub.id = ?
     `;
     
-    db.query(sql, [req.params.id], (err, data) => {
+    pool.query(sql, [req.params.id], (err, data) => {
         if (err) {
             console.error("❌ SQL ERROR:", err.sqlMessage); 
             return res.status(500).json({ error: "Database rejected the query" });
@@ -575,11 +539,11 @@ app.get('/api/teacher/:id/attendance-history', (req, res) => {
         JOIN courses c ON s.course_id = c.id
         LEFT JOIN attendance a ON dc.id = a.daily_class_id
         WHERE dc.teacher_id = (SELECT teacher_id FROM teachers WHERE user_id = ?)
-        GROUP BY dc.id
+        GROUP BY dc.id, c.course_name, s.semester, s.subject_name
         ORDER BY dc.class_date DESC
     `;
 
-    db.query(sql, [req.params.id], (err, data) => {
+    pool.query(sql, [req.params.id], (err, data) => {
         if (err) {
             console.error("❌ SQL ERROR fetching history:", err.sqlMessage);
             return res.status(500).json({ error: "Failed to load history" });
@@ -600,7 +564,7 @@ app.get('/api/attendance/class/:classId', (req, res) => {
         WHERE a.daily_class_id = ?
     `;
 
-    db.query(sql, [req.params.classId], (err, data) => {
+    pool.query(sql, [req.params.classId], (err, data) => {
         if (err) {
             console.error("❌ SQL ERROR fetching details:", err.sqlMessage);
             return res.status(500).json({ error: "Failed to load details" });
@@ -621,7 +585,7 @@ app.get('/api/subjects/:id/students', (req, res) => {
         JOIN subjects sub ON st.course_id = sub.course_id AND st.semester = sub.semester
         WHERE sub.id = ?
     `;
-    db.query(sql, [req.params.id], (err, data) => {
+    pool.query(sql, [req.params.id], (err, data) => {
         if (err) return res.status(500).json({ error: "Failed to fetch students" });
         res.json(data);
     });
@@ -636,7 +600,7 @@ app.get('/api/marks/details', (req, res) => {
         JOIN students st ON m.student_id = st.student_id
         WHERE m.subject_id = ? AND m.exam_type = ?
     `;
-    db.query(sql, [subject_id, exam_type], (err, data) => {
+    pool.query(sql, [subject_id, exam_type], (err, data) => {
         if (err) return res.status(500).json(err);
         res.json(data);
     });
@@ -648,7 +612,7 @@ app.post('/api/marks', (req, res) => {
 
     // First find the exact teacher_id
     const getTeacherSql = `SELECT teacher_id FROM teachers WHERE user_id = ?`;
-    db.query(getTeacherSql, [uploaded_by_user_id], (err, teacherData) => {
+    pool.query(getTeacherSql, [uploaded_by_user_id], (err, teacherData) => {
         if (err || teacherData.length === 0) return res.status(500).json({ error: "Teacher lookup failed" });
 
         const teacherId = teacherData[0].teacher_id;
@@ -661,14 +625,15 @@ app.post('/api/marks', (req, res) => {
             m.id, subject_id, exam_type, m.score, max_score, teacherId
         ]);
 
-        // ON DUPLICATE KEY UPDATE allows teachers to edit/save drafts securely
+        // ON CONFLICT allows teachers to edit/save drafts securely.
         const sql = `
             INSERT INTO marks (student_id, subject_id, exam_type, score, max_score, uploaded_by)
             VALUES ?
-            ON DUPLICATE KEY UPDATE score = VALUES(score), max_score = VALUES(max_score), uploaded_by = VALUES(uploaded_by)
+            ON CONFLICT (student_id, subject_id, exam_type)
+            DO UPDATE SET score = EXCLUDED.score, max_score = EXCLUDED.max_score, uploaded_by = EXCLUDED.uploaded_by
         `;
 
-        db.query(sql, [values], (err, result) => {
+        pool.query(sql, [values], (err, result) => {
             if (err) {
                 console.error("❌ SQL ERROR saving marks:", err.sqlMessage);
                 return res.status(500).json({ error: "Failed to save marks" });
@@ -698,7 +663,7 @@ app.get('/api/teacher/:id/marks-ledger', (req, res) => {
         GROUP BY m.subject_id, m.exam_type, s.subject_name, s.semester, c.course_name
         ORDER BY MAX(m.created_at) DESC
     `;
-    db.query(sql, [req.params.id], (err, data) => {
+    pool.query(sql, [req.params.id], (err, data) => {
         if (err) return res.status(500).json(err);
         res.json(data);
     });
@@ -713,7 +678,7 @@ app.get('/api/teacher/:id/dashboard', (req, res) => {
     // 1. Get Teacher ID and Name
     const teacherSql = `SELECT teacher_id, full_name FROM teachers WHERE user_id = ?`;
 
-    db.query(teacherSql, [userId], (err, teacherResult) => {
+    pool.query(teacherSql, [userId], (err, teacherResult) => {
         if (err || teacherResult.length === 0) return res.status(404).json({ error: "Teacher not found" });
 
         const teacherId = teacherResult[0].teacher_id;
@@ -724,7 +689,7 @@ app.get('/api/teacher/:id/dashboard', (req, res) => {
             SELECT 
                 (SELECT COUNT(*) FROM teacher_assignments WHERE teacher_id = ?) as totalSubjects,
                 (SELECT COUNT(st.student_id) FROM students st 
-                 JOIN subjects sub ON st.course_id = sub.course_id 
+                 JOIN subjects sub ON st.course_id = sub.course_id AND st.semester = sub.semester
                  JOIN teacher_assignments ta ON sub.id = ta.subject_id 
                  WHERE ta.teacher_id = ?) as totalStudents
         `;
@@ -757,9 +722,9 @@ app.get('/api/teacher/:id/dashboard', (req, res) => {
             ORDER BY created_at DESC LIMIT 3
         `;
 
-        db.query(statsSql, [teacherId, teacherId], (err, statsResult) => {
-            db.query(classesSql, [teacherId], (err, classesResult) => {
-                db.query(noticesSql, (err, noticesResult) => {
+        pool.query(statsSql, [teacherId, teacherId], (err, statsResult) => {
+            pool.query(classesSql, [teacherId], (err, classesResult) => {
+                pool.query(noticesSql, (err, noticesResult) => {
                     res.json({
                         teacherName: teacherName,
                         stats: {
@@ -785,7 +750,7 @@ app.post('/api/teacher/schedule-class', (req, res) => {
     // Step 1: Find the actual teacher_id belonging to this logged-in user
     const findTeacherSql = `SELECT teacher_id FROM teachers WHERE user_id = ?`;
 
-    db.query(findTeacherSql, [userId], (err, teacherResult) => {
+    pool.query(findTeacherSql, [userId], (err, teacherResult) => {
         if (err || teacherResult.length === 0) {
             console.error("Teacher Lookup Error:", err);
             return res.status(404).json({ error: "Teacher account not found for this user." });
@@ -799,7 +764,7 @@ app.post('/api/teacher/schedule-class', (req, res) => {
             VALUES (?, ?, ?, ?, ?, ?)
         `;
 
-        db.query(insertSql, [exactTeacherId, subjectId, date, startTime, endTime, room], (err, result) => {
+        pool.query(insertSql, [exactTeacherId, subjectId, date, startTime, endTime, room], (err, result) => {
             if (err) {
                 console.error("Insert Class Error:", err);
                 return res.status(500).json({ error: "Failed to schedule class in database." });
@@ -845,7 +810,7 @@ app.get('/api/student/:id/notices', (req, res) => {
         ORDER BY n.created_at DESC
     `;
 
-    db.query(sql, [userId], (err, data) => {
+    pool.query(sql, [userId], (err, data) => {
         if (err) {
             console.error("❌ SQL ERROR:", err.sqlMessage);
             return res.status(500).json({ error: err.sqlMessage });
@@ -881,7 +846,7 @@ app.get('/api/student/:id/results', (req, res) => {
         ORDER BY sub.semester ASC;
     `;
 
-    db.query(sql, [userId], (err, data) => {
+    pool.query(sql, [userId], (err, data) => {
         if (err) {
             console.error("Database Error:", err);
             return res.status(500).json({ error: "Failed to fetch results" });
@@ -938,7 +903,7 @@ app.get('/api/student/:id/subjects-list', (req, res) => {
         FROM subjects s
         JOIN students st ON s.course_id = st.course_id
         WHERE st.user_id = ? AND s.semester = ?`;
-    db.query(sql, [userId, semester], (err, data) => {
+    pool.query(sql, [userId, semester], (err, data) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(data);
     });
@@ -959,7 +924,7 @@ app.get('/api/student/:id/attendance-logs', (req, res) => {
         JOIN students st ON a.student_id = st.student_id
         WHERE st.user_id = ? AND s.semester = ?
         ORDER BY dc.class_date DESC`;
-    db.query(sql, [userId, semester], (err, data) => {
+    pool.query(sql, [userId, semester], (err, data) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(data);
     });
@@ -984,7 +949,7 @@ app.get('/api/student/:id/subjects', (req, res) => {
         WHERE st.user_id = ? AND s.semester = ?
     `;
 
-    db.query(sql, [userId, semester], (err, data) => {
+    pool.query(sql, [userId, semester], (err, data) => {
         if (err) {
             console.error("SQL Error:", err.message);
             return res.status(500).json({ error: err.message });
@@ -1015,7 +980,7 @@ app.get('/api/student/:id/profile', (req, res) => {
         WHERE s.user_id = ?
     `;
     
-    db.query(sql, [userId], (err, data) => {
+    pool.query(sql, [userId], (err, data) => {
         if (err) return res.status(500).json({ error: err.message });
         if (data.length === 0) return res.status(404).json({ message: "Student not found" });
 
@@ -1085,7 +1050,7 @@ app.put('/api/student/:id/profile', (req, res) => {
         father_name, emergency_contact, guardian_relation, profile_picture, userId
     ];
 
-    db.query(sql, params, (err, result) => {
+    pool.query(sql, params, (err, result) => {
         if (err) {
             console.error("❌ SQL Error:", err.message);
             return res.status(500).json({ error: "Failed to update database records." });
@@ -1116,7 +1081,7 @@ app.get('/api/student/:id/custom-dashboard', (req, res) => {
         FROM daily_classes dc
         JOIN subjects sub ON dc.subject_id = sub.id
         JOIN teachers t ON dc.teacher_id = t.teacher_id
-        JOIN students st ON sub.course_id = st.course_id AND sub.semester = sub.semester
+        JOIN students st ON sub.course_id = st.course_id AND st.semester = sub.semester
         WHERE st.user_id = ? AND dc.class_date = CURDATE()
         ORDER BY dc.start_time ASC
     `;
@@ -1148,17 +1113,17 @@ app.get('/api/student/:id/custom-dashboard', (req, res) => {
         ORDER BY sub.semester ASC
     `;
 
-    db.query(profileSql, [userId], (err, profileData) => {
+    pool.query(profileSql, [userId], (err, profileData) => {
         if (err) return res.status(500).json({ error: "Profile fetch failed" });
         if (profileData.length === 0) return res.status(404).json({ error: "Student not found" });
 
-        db.query(classesSql, [userId], (err, classesData) => {
+        pool.query(classesSql, [userId], (err, classesData) => {
             if (err) return res.status(500).json({ error: "Classes fetch failed" });
 
-            db.query(noticesSql, (err, noticesData) => {
+            pool.query(noticesSql, (err, noticesData) => {
                 if (err) return res.status(500).json({ error: "Notices fetch failed" });
 
-                db.query(performanceSql, [userId], (err, perfData) => {
+                pool.query(performanceSql, [userId], (err, perfData) => {
                     if (err) return res.status(500).json({ error: "Performance fetch failed" });
 
                     const mappedNotices = noticesData.map(n => ({
@@ -1187,7 +1152,8 @@ app.get('/api/student/:id/custom-dashboard', (req, res) => {
 });
 
 // --- START THE SERVER ---
-const PORT = 5000;
+
+const PORT = process.env.PORT ;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on http://localhost:${PORT}`);
 });
